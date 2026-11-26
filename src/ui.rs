@@ -61,6 +61,19 @@ enum Cached {
     Unavailable(String),
 }
 
+#[derive(Clone)]
+struct PendingKeep {
+    group: usize,
+    keep: PathBuf,
+    others: Vec<PathBuf>,
+}
+
+enum KeepAction {
+    Wait,
+    Confirm,
+    Cancel,
+}
+
 #[derive(Default)]
 struct CardActions {
     toggles: Vec<(String, bool)>,
@@ -100,6 +113,7 @@ pub struct DuplicateApp {
     loading: HashSet<PathBuf>,
     cache: std::collections::HashMap<PathBuf, Cached>,
     theme: ThemeId,
+    pending_keep: Option<PendingKeep>,
 }
 
 impl DuplicateApp {
@@ -139,6 +153,7 @@ impl DuplicateApp {
             theme: saved_theme
                 .and_then(ThemeId::parse)
                 .unwrap_or(ThemeId::Lime),
+            pending_keep: None,
         }
     }
 
@@ -151,6 +166,7 @@ impl DuplicateApp {
         self.preview_panel(ctx);
         self.center(ctx);
         self.status_bar(ctx);
+        self.keep_modal(ctx);
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -342,7 +358,7 @@ impl DuplicateApp {
                         self.tab = Tab::Duplicates;
                     }
                     ui.label(
-                        egui::RichText::new("ничего не удаляем")
+                        egui::RichText::new("в корзину только после «оставить»")
                             .size(12.0)
                             .color(colors(ui.ctx()).muted),
                     );
@@ -703,75 +719,391 @@ impl DuplicateApp {
             ));
         }
         let needle = self.dup_filter.to_lowercase();
-        egui::ScrollArea::vertical().id_salt("dups").show(ui, |ui| {
-            if group_count == 0 {
-                ui.label("Одинаковых файлов в выбранных форматах нет.");
-                return;
-            }
-            for idx in 0..group_count {
-                let (visible, title) = {
-                    let group = &self.results.as_ref().unwrap().groups[idx];
-                    let visible = needle.is_empty()
-                        || group.files.iter().any(|file| {
-                            file.path.to_string_lossy().to_lowercase().contains(&needle)
-                        });
-                    let title = group_title(group);
-                    (visible, title)
-                };
-                if !visible {
-                    continue;
-                }
-                let selected = self.picked_group == Some(idx);
-                if ui
-                    .selectable_label(selected, egui::RichText::new(title).strong())
-                    .clicked()
-                {
-                    self.picked_group = Some(idx);
-                    let file = self.results.as_ref().unwrap().groups[idx]
+        let visible: Vec<usize> = (0..group_count)
+            .filter(|&idx| {
+                needle.is_empty()
+                    || self.results.as_ref().unwrap().groups[idx]
                         .files
-                        .first()
-                        .cloned();
-                    if let Some(file) = file {
-                        self.focus_file(ui.ctx(), &file);
+                        .iter()
+                        .any(|file| file.path.to_string_lossy().to_lowercase().contains(&needle))
+            })
+            .collect();
+        if visible.is_empty() {
+            ui.label(if group_count == 0 {
+                "Одинаковых файлов в выбранных форматах нет."
+            } else {
+                "По этому фильтру групп нет."
+            });
+            return;
+        }
+        if !self.picked_group.is_some_and(|idx| visible.contains(&idx)) {
+            self.picked_group = visible.first().copied();
+        }
+        self.dup_group_files(ui);
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(format!("группы · {}", format_count(visible.len() as u64)))
+                .small()
+                .color(colors(ui.ctx()).muted),
+        );
+        let row_h = ui.spacing().interact_size.y;
+        let mut pick: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("dups")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_h, visible.len(), |ui, range| {
+                for row in range {
+                    let idx = visible[row];
+                    let title = group_title(&self.results.as_ref().unwrap().groups[idx]);
+                    let selected = self.picked_group == Some(idx);
+                    if ui
+                        .push_id(idx, |ui| {
+                            ui.selectable_label(selected, egui::RichText::new(title).strong())
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        pick = Some(idx);
                     }
                 }
-                if self.picked_group == Some(idx) {
-                    let files = self.results.as_ref().unwrap().groups[idx].files.clone();
-                    for file in &files {
-                        self.dup_path(ui, file);
+            });
+        if let Some(idx) = pick {
+            self.open_group(ui.ctx(), idx);
+        }
+    }
+
+    fn dup_group_files(&mut self, ui: &mut egui::Ui) {
+        let Some(idx) = self.picked_group else {
+            return;
+        };
+        let Some(group) = self
+            .results
+            .as_ref()
+            .and_then(|outcome| outcome.groups.get(idx))
+        else {
+            return;
+        };
+        let title = group_title(group);
+        let file_count = group.files.len();
+        let paint = colors(ui.ctx());
+        let mut focus: Option<DupFile> = None;
+        let mut reveal: Option<std::path::PathBuf> = None;
+        let mut copy: Option<String> = None;
+        let mut keep: Option<usize> = None;
+        let mut delete_rest = false;
+        egui::Frame::new()
+            .fill(paint.card)
+            .stroke(egui::Stroke::new(1.0, paint.accent))
+            .corner_radius(16u8)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(title).strong().color(paint.accent));
+                    if file_count > 1
+                        && stop_button(ui, "удалить дубли")
+                            .on_hover_text("Оставить верхний файл, остальные убрать в корзину.")
+                            .clicked()
+                    {
+                        delete_rest = true;
                     }
-                    ui.add_space(6.0);
-                }
-            }
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} в этой группе. Верхний файл остаётся.",
+                        files_label(file_count as u64)
+                    ))
+                    .small()
+                    .color(paint.muted),
+                );
+                let row_h = ui.spacing().interact_size.y.max(28.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(("dup-files", idx))
+                    .max_height(row_h * 8.0 + 12.0)
+                    .auto_shrink([false, true])
+                    .show_rows(ui, row_h, file_count, |ui, range| {
+                        let group = &self.results.as_ref().unwrap().groups[idx];
+                        for file_idx in range {
+                            let Some(file) = group.files.get(file_idx) else {
+                                continue;
+                            };
+                            let name = file
+                                .path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| file.path.display().to_string());
+                            let path = file.path.display().to_string();
+                            let meta = format!("{} · {path}", format_mtime(file.modified));
+                            ui.push_id(file_idx, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button(name).clicked() {
+                                        focus = Some(file.clone());
+                                    }
+                                    if ui.small_button("в папке").clicked() {
+                                        reveal = Some(file.path.clone());
+                                    }
+                                    if ui.small_button("копировать").clicked() {
+                                        copy = Some(path.clone());
+                                    }
+                                    if ui.small_button("оставить").clicked() {
+                                        keep = Some(file_idx);
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(meta).small().color(paint.muted),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            });
+                        }
+                    });
+            });
+        if let Some(file) = focus {
+            self.focus_file(ui.ctx(), &file);
+        }
+        if let Some(path) = reveal {
+            self.reveal(&path);
+        }
+        if let Some(path) = copy {
+            ui.ctx().copy_text(path);
+        }
+        if delete_rest {
+            self.ask_keep(idx, 0);
+        } else if let Some(file_idx) = keep {
+            self.ask_keep(idx, file_idx);
+        }
+    }
+
+    fn ask_keep(&mut self, group_idx: usize, file_idx: usize) {
+        let Some(group) = self
+            .results
+            .as_ref()
+            .and_then(|outcome| outcome.groups.get(group_idx))
+        else {
+            return;
+        };
+        let Some(keep) = group.files.get(file_idx) else {
+            return;
+        };
+        let keep_path = keep.path.clone();
+        let others: Vec<PathBuf> = group
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(idx, file)| *idx != file_idx && file.path != keep_path)
+            .map(|(_, file)| file.path.clone())
+            .collect();
+        if others.is_empty() {
+            self.banner = Some("В этой группе больше нечего убирать.".into());
+            return;
+        }
+        self.pending_keep = Some(PendingKeep {
+            group: group_idx,
+            keep: keep_path,
+            others,
         });
     }
 
-    fn dup_path(&mut self, ui: &mut egui::Ui, file: &DupFile) {
-        ui.horizontal_wrapped(|ui| {
-            let name = file
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| file.path.display().to_string());
-            if ui.button(name).clicked() {
-                self.focus_file(ui.ctx(), file);
+    fn keep_modal(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_keep.clone() else {
+            return;
+        };
+        let paint = colors(ctx);
+        let group_name = self
+            .results
+            .as_ref()
+            .and_then(|outcome| outcome.groups.get(pending.group))
+            .map(group_title);
+        let mut action = KeepAction::Wait;
+        let shown = pending.others.len().min(30);
+        let response = egui::Modal::new(egui::Id::new("keep-others"))
+            .frame(
+                egui::Frame::new()
+                    .fill(paint.card)
+                    .stroke(egui::Stroke::new(1.0, paint.accent))
+                    .corner_radius(18u8)
+                    .inner_margin(16.0),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.label(
+                    egui::RichText::new("оставить")
+                        .size(24.0)
+                        .strong()
+                        .color(paint.accent),
+                );
+                if let Some(group_name) = &group_name {
+                    ui.label(egui::RichText::new(group_name).color(paint.muted));
+                }
+                ui.label("Этот файл остаётся на месте.");
+                ui.label(egui::RichText::new(pending.keep.display().to_string()).small());
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "Остальные {} уйдут в корзину.",
+                    files_label(pending.others.len() as u64)
+                ));
+                egui::ScrollArea::vertical()
+                    .id_salt("keep-list")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for path in pending.others.iter().take(shown) {
+                            ui.label(egui::RichText::new(path.display().to_string()).small());
+                        }
+                        if pending.others.len() > shown {
+                            ui.label(format!(
+                                "и ещё {}",
+                                format_count((pending.others.len() - shown) as u64)
+                            ));
+                        }
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if stop_button(ui, "Удалить остальные").clicked() {
+                        action = KeepAction::Confirm;
+                    }
+                    if ghost_button(ui, "Отмена").clicked() {
+                        action = KeepAction::Cancel;
+                    }
+                });
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    action = KeepAction::Cancel;
+                }
+            });
+        if !matches!(action, KeepAction::Confirm) && response.backdrop_response.clicked() {
+            action = KeepAction::Cancel;
+        }
+        match action {
+            KeepAction::Confirm => {
+                self.pending_keep = None;
+                self.delete_others(ctx, &pending);
             }
-            if ui.small_button("в папке").clicked() {
-                self.reveal(&file.path);
+            KeepAction::Cancel => self.pending_keep = None,
+            KeepAction::Wait => {}
+        }
+    }
+
+    fn delete_others(&mut self, ctx: &egui::Context, pending: &PendingKeep) {
+        let mut gone = HashSet::new();
+        let mut errors = Vec::new();
+        for path in &pending.others {
+            if path == &pending.keep {
+                continue;
             }
-            if ui.small_button("копировать").clicked() {
-                ui.ctx().copy_text(file.path.display().to_string());
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => {
+                    errors.push(format!("{}: это папка, её не трогаю", path.display()));
+                }
+                Ok(_) => match trash::delete(path) {
+                    Ok(()) => {
+                        gone.insert(path.clone());
+                    }
+                    Err(err) => errors.push(format!("{}: {err}", path.display())),
+                },
+                Err(err) => errors.push(format!("{}: {err}", path.display())),
             }
+        }
+        if !gone.is_empty() {
+            if let Some(outcome) = &mut self.results {
+                drop_gone(&mut outcome.groups, &gone);
+            }
+            self.clamp_picked_group();
+            self.forget_inventory(&gone);
+            for path in &gone {
+                self.cache.remove(path);
+                self.loading.remove(path);
+            }
+            if self
+                .focus
+                .as_ref()
+                .is_some_and(|focus| gone.contains(&focus.path))
+            {
+                self.focus = None;
+            }
+            self.focus_kept(ctx, &pending.keep);
+        }
+        self.banner = Some(keep_banner(gone.len(), &pending.keep, &errors));
+    }
+
+    fn clamp_picked_group(&mut self) {
+        let len = self
+            .results
+            .as_ref()
+            .map(|outcome| outcome.groups.len())
+            .unwrap_or(0);
+        self.picked_group = match self.picked_group {
+            Some(idx) if idx < len => Some(idx),
+            Some(_) if len > 0 => Some(len - 1),
+            _ => None,
+        };
+    }
+
+    fn forget_inventory(&mut self, gone: &HashSet<PathBuf>) {
+        let Some(inventory) = &self.inventory else {
+            return;
+        };
+        let files: Vec<_> = inventory
+            .files
+            .iter()
+            .filter(|file| !gone.contains(&file.path))
+            .cloned()
+            .collect();
+        let empty_files = files.iter().filter(|file| file.size == 0).count() as u64;
+        let formats = summarize(&files, self.min_size);
+        if let Some(inventory) = &mut self.inventory {
+            inventory.empty_files = empty_files;
+            inventory.files = Arc::new(files);
+            inventory.formats = formats.clone();
+        }
+        self.formats = formats;
+        self.stats_dirty = true;
+    }
+
+    fn focus_kept(&mut self, ctx: &egui::Context, path: &Path) {
+        let ext = extension_of(path);
+        let (kind, _, _) = classify(&ext);
+        let modified = self.inventory.as_ref().and_then(|inventory| {
+            inventory
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .and_then(|file| file.modified)
         });
-        ui.label(
-            egui::RichText::new(format!(
-                "{} · {}",
-                format_mtime(file.modified),
-                file.path.display()
-            ))
-            .small()
-            .color(colors(ui.ctx()).muted),
+        let size = self
+            .results
+            .as_ref()
+            .and_then(|outcome| {
+                outcome
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.files.iter())
+                    .find(|file| file.path == path)
+                    .map(|file| file.size)
+            })
+            .unwrap_or(0);
+        self.arm_focus(
+            ctx,
+            Focus {
+                path: path.to_path_buf(),
+                size,
+                modified,
+                ext,
+                kind,
+            },
         );
+    }
+
+    fn open_group(&mut self, ctx: &egui::Context, idx: usize) {
+        self.picked_group = Some(idx);
+        let file = self
+            .results
+            .as_ref()
+            .and_then(|outcome| outcome.groups.get(idx))
+            .and_then(|group| group.files.first())
+            .cloned();
+        if let Some(file) = file {
+            self.focus_file(ctx, &file);
+        }
     }
 
     fn preview_panel(&mut self, ctx: &egui::Context) {
@@ -974,6 +1306,7 @@ impl DuplicateApp {
         self.selected.clear();
         self.results = None;
         self.picked_group = None;
+        self.pending_keep = None;
         self.focus = None;
         self.cache.clear();
         self.loading.clear();
@@ -1009,6 +1342,7 @@ impl DuplicateApp {
         self.cancel_job();
         self.results = None;
         self.picked_group = None;
+        self.pending_keep = None;
         self.tab = Tab::Duplicates;
         self.banner = None;
         let opts = SearchOptions {
@@ -1597,6 +1931,38 @@ fn kind_color(kind: FormatKind, dark: bool) -> egui::Color32 {
     }
 }
 
+fn drop_gone(groups: &mut Vec<DupGroup>, gone: &HashSet<PathBuf>) {
+    for group in groups.iter_mut() {
+        group.files.retain(|file| !gone.contains(&file.path));
+        group.copies = group.files.len();
+        let total: u64 = group.files.iter().map(|file| file.size).sum();
+        let largest = group.files.iter().map(|file| file.size).max().unwrap_or(0);
+        group.reclaimable = total.saturating_sub(largest);
+        if let Some(first) = group.files.first() {
+            group.size = first.size;
+        }
+    }
+    groups.retain(|group| group.files.len() > 1);
+}
+
+fn keep_banner(count: usize, keep: &Path, errors: &[String]) -> String {
+    if count == 0 {
+        return errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Ничего не убрано.".into());
+    }
+    let done = format!(
+        "В корзине {}. Оставлен {}",
+        files_label(count as u64),
+        keep.display()
+    );
+    match errors.first() {
+        Some(err) => format!("{done}. Не вышло: {err}"),
+        None => done,
+    }
+}
+
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     let result = {
         #[cfg(target_os = "macos")]
@@ -1626,4 +1992,47 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
         }
     };
     result.map(|_| ()).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(paths: &[&str]) -> DupGroup {
+        let files: Vec<DupFile> = paths
+            .iter()
+            .map(|path| DupFile {
+                path: PathBuf::from(path),
+                size: 10,
+                modified: None,
+            })
+            .collect();
+        let copies = files.len();
+        DupGroup {
+            size: 10,
+            copies,
+            reclaimable: 10 * copies.saturating_sub(1) as u64,
+            hash: String::new(),
+            files,
+        }
+    }
+
+    #[test]
+    fn drop_gone_removes_pair_when_one_copy_stays() {
+        let mut groups = vec![group(&["/keep", "/drop"])];
+        let gone = HashSet::from([PathBuf::from("/drop")]);
+        drop_gone(&mut groups, &gone);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn drop_gone_keeps_a_group_that_still_has_two_copies() {
+        let mut groups = vec![group(&["/keep", "/a", "/b"])];
+        let gone = HashSet::from([PathBuf::from("/a")]);
+        drop_gone(&mut groups, &gone);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].copies, 2);
+        assert_eq!(groups[0].reclaimable, 10);
+        assert_eq!(groups[0].files[0].path, PathBuf::from("/keep"));
+    }
 }
