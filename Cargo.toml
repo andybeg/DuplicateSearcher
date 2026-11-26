@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Поиск одинаковых файлов с предпросмотром форматов. macOS, Linux и Windows 11."
 publish = false
-rust-version = "1.74"
+rust-version = "1.81"
 license = "MIT"
 
 [dependencies]
 blake3 = "1.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-eframe = "0.31"
+eframe = { version = "0.31", features = ["persistence"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
 rayon = "1.10"
 rfd = "0.15"

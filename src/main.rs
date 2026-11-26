@@ -18,8 +18,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             install_fonts(&cc.egui_ctx);
-            ui::install_look(&cc.egui_ctx);
-            Ok(Box::new(ui::DuplicateApp::new()))
+            let saved = cc.storage.and_then(|storage| storage.get_string("theme"));
+            let app = ui::DuplicateApp::new(saved.as_deref());
+            app.apply_look(&cc.egui_ctx);
+            Ok(Box::new(app))
         }),
     )
 }

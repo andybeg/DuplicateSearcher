@@ -99,10 +99,11 @@ pub struct DuplicateApp {
     preview_rx: Receiver<(PathBuf, Preview)>,
     loading: HashSet<PathBuf>,
     cache: std::collections::HashMap<PathBuf, Cached>,
+    theme: ThemeId,
 }
 
 impl DuplicateApp {
-    pub fn new() -> Self {
+    pub fn new(saved_theme: Option<&str>) -> Self {
         let (preview_tx, preview_rx) = mpsc::channel();
         Self {
             root: None,
@@ -135,10 +136,14 @@ impl DuplicateApp {
             preview_rx,
             loading: HashSet::new(),
             cache: std::collections::HashMap::new(),
+            theme: saved_theme
+                .and_then(ThemeId::parse)
+                .unwrap_or(ThemeId::Lime),
         }
     }
 
     fn update(&mut self, ctx: &egui::Context) {
+        self.apply_look(ctx);
         self.poll(ctx);
         self.dropped_folder(ctx);
         self.recompute_stats();
@@ -243,23 +248,27 @@ impl DuplicateApp {
 
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("bar")
-            .frame(bar_frame())
+            .frame(bar_frame(ctx))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    let paint = colors(ui.ctx());
                     ui.label(
                         egui::RichText::new("дубли")
                             .size(26.0)
                             .strong()
-                            .color(ACCENT),
+                            .color(paint.accent),
                     );
                     if ghost_button(ui, "Папка").clicked() {
                         self.pick_folder(ui.ctx());
                     }
                     if let Some(root) = &self.root {
-                        ui.label(egui::RichText::new(root.display().to_string()).color(MUTED));
+                        ui.label(
+                            egui::RichText::new(root.display().to_string()).color(paint.muted),
+                        );
                     } else {
-                        ui.label(egui::RichText::new("перетащи папку сюда").color(MUTED));
+                        ui.label(egui::RichText::new("перетащи папку сюда").color(paint.muted));
                     }
+                    self.theme_picker(ui);
                 });
                 ui.horizontal_wrapped(|ui| {
                     let before = self.min_size;
@@ -311,7 +320,7 @@ impl DuplicateApp {
                             format_bytes(self.selected_bytes)
                         );
                         if ui
-                            .add_enabled(enabled, accent_button_widget(label))
+                            .add_enabled(enabled, accent_button_widget(label, colors(ui.ctx())))
                             .clicked()
                         {
                             self.start_search(ui.ctx());
@@ -335,11 +344,11 @@ impl DuplicateApp {
                     ui.label(
                         egui::RichText::new("ничего не удаляем")
                             .size(12.0)
-                            .color(MUTED),
+                            .color(colors(ui.ctx()).muted),
                     );
                 });
                 if let Some(banner) = &self.banner {
-                    ui.colored_label(egui::Color32::from_rgb(252, 165, 165), banner);
+                    ui.colored_label(colors(ui.ctx()).stop, banner);
                 }
                 ui.add_space(2.0);
             });
@@ -373,19 +382,22 @@ impl DuplicateApp {
                 egui::RichText::new("дубли")
                     .size(64.0)
                     .strong()
-                    .color(ACCENT),
+                    .color(colors(ui.ctx()).accent),
             );
             ui.label(
                 egui::RichText::new("одинаковые файлы. без удаления.")
                     .size(18.0)
-                    .color(MUTED),
+                    .color(colors(ui.ctx()).muted),
             );
             ui.add_space(18.0);
             if accent_button(ui, "Выбрать папку").clicked() {
                 self.pick_folder(ui.ctx());
             }
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("или просто перетащи папку в окно").color(MUTED));
+            ui.label(
+                egui::RichText::new("или просто перетащи папку в окно")
+                    .color(colors(ui.ctx()).muted),
+            );
         });
     }
 
@@ -402,7 +414,7 @@ impl DuplicateApp {
                         egui::RichText::new("смотрю")
                             .size(36.0)
                             .strong()
-                            .color(ACCENT),
+                            .color(colors(ui.ctx()).accent),
                     );
                     let files = job.progress.files_seen.load(Ordering::Relaxed);
                     let bytes = job.progress.bytes_seen.load(Ordering::Relaxed);
@@ -417,7 +429,7 @@ impl DuplicateApp {
                         egui::RichText::new("сверяю")
                             .size(36.0)
                             .strong()
-                            .color(ACCENT),
+                            .color(colors(ui.ctx()).accent),
                     );
                     let done = job.progress.hashed_files.load(Ordering::Relaxed);
                     let total = job.progress.hash_total.load(Ordering::Relaxed);
@@ -430,7 +442,10 @@ impl DuplicateApp {
                     ));
                 }
             }
-            ui.label(egui::RichText::new("окно не зависает. файлы на месте.").color(MUTED));
+            ui.label(
+                egui::RichText::new("окно не зависает. файлы на месте.")
+                    .color(colors(ui.ctx()).muted),
+            );
         });
     }
 
@@ -494,15 +509,16 @@ impl DuplicateApp {
             .focus
             .as_ref()
             .is_some_and(|focus| focus.ext == info.extension);
-        let color = kind_color(info.kind);
+        let paint = colors(ui.ctx());
+        let color = kind_color(info.kind, paint.dark);
         let stroke = if active {
-            egui::Stroke::new(2.0, ACCENT)
+            egui::Stroke::new(2.0, paint.accent)
         } else if checked {
             egui::Stroke::new(1.0, color)
         } else {
-            egui::Stroke::new(1.0, STROKE)
+            egui::Stroke::new(1.0, paint.stroke)
         };
-        let fill = if checked { CARD } else { CARD_DIM };
+        let fill = if checked { paint.card } else { paint.card_dim };
         egui::Frame::new()
             .fill(fill)
             .stroke(stroke)
@@ -521,7 +537,7 @@ impl DuplicateApp {
                             egui::RichText::new(&info.title)
                                 .size(18.0)
                                 .strong()
-                                .color(TEXT),
+                                .color(paint.text),
                         )
                         .clicked()
                     {
@@ -533,7 +549,7 @@ impl DuplicateApp {
                         ui.label(egui::RichText::new(&info.extension).small().color(color));
                     });
                 });
-                ui.label(egui::RichText::new(&info.blurb).small().color(MUTED));
+                ui.label(egui::RichText::new(&info.blurb).small().color(paint.muted));
                 ui.label(format!(
                     "{} · {}",
                     files_label(info.files),
@@ -573,6 +589,7 @@ impl DuplicateApp {
             ext: info.extension.clone(),
             kind: info.kind,
         };
+        let dark = colors(ui.ctx()).dark;
         let response = match self.cache.get(&sample.path) {
             Some(Cached::Image(texture)) => ui.add(
                 egui::Image::from_texture((texture.id(), texture.size_vec2()))
@@ -598,14 +615,14 @@ impl DuplicateApp {
                 egui::Button::new(
                     egui::RichText::new(&info.title)
                         .strong()
-                        .color(kind_color(info.kind)),
+                        .color(kind_color(info.kind, dark)),
                 ),
             ),
             None => {
                 actions.want.push((sample.path.clone(), info.kind));
                 ui.add_sized(
                     [68.0, 68.0],
-                    egui::Button::new(egui::RichText::new("…").color(kind_color(info.kind))),
+                    egui::Button::new(egui::RichText::new("…").color(kind_color(info.kind, dark))),
                 )
             }
         };
@@ -753,7 +770,7 @@ impl DuplicateApp {
                 file.path.display()
             ))
             .small()
-            .color(egui::Color32::from_rgb(170, 178, 190)),
+            .color(colors(ui.ctx()).muted),
         );
     }
 
@@ -762,13 +779,13 @@ impl DuplicateApp {
             .resizable(true)
             .default_width(400.0)
             .min_width(280.0)
-            .frame(bar_frame())
+            .frame(bar_frame(ctx))
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("смотри")
                         .size(26.0)
                         .strong()
-                        .color(ACCENT),
+                        .color(colors(ui.ctx()).accent),
                 );
                 let Some(focus) = self.focus.clone() else {
                     ui.label("Нажмите формат или файл, чтобы увидеть его здесь.");
@@ -823,13 +840,13 @@ impl DuplicateApp {
 
     fn status_bar(&self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status")
-            .frame(bar_frame())
+            .frame(bar_frame(ctx))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new(self.criteria_line())
                             .size(12.0)
-                            .color(MUTED),
+                            .color(colors(ui.ctx()).muted),
                     );
                     if let Some(inventory) = &self.inventory {
                         ui.separator();
@@ -861,7 +878,7 @@ impl DuplicateApp {
         egui::CollapsingHeader::new(
             egui::RichText::new("критерии совпадения")
                 .strong()
-                .color(TEXT),
+                .color(colors(ui.ctx()).text),
         )
         .id_salt("match-rules")
         .default_open(true)
@@ -902,7 +919,7 @@ impl DuplicateApp {
             }
             if !self.has_rule() {
                 ui.colored_label(
-                    egui::Color32::from_rgb(252, 165, 165),
+                    colors(ui.ctx()).stop,
                     "Нужен хотя бы один признак: содержимое, размер, имя или дата.",
                 );
             }
@@ -1195,6 +1212,30 @@ impl DuplicateApp {
         ctx.request_repaint();
     }
 
+    fn theme_picker(&mut self, ui: &mut egui::Ui) {
+        let before = self.theme;
+        let paint = colors(ui.ctx());
+        let response = egui::ComboBox::from_id_salt("theme")
+            .selected_text(
+                egui::RichText::new(self.theme.label())
+                    .strong()
+                    .color(paint.accent),
+            )
+            .show_ui(ui, |ui| {
+                for theme in ThemeId::ALL {
+                    ui.selectable_value(&mut self.theme, theme, theme.label());
+                }
+            });
+        response.response.on_hover_text("цветовая тема");
+        if self.theme != before {
+            self.apply_look(ui.ctx());
+        }
+    }
+
+    pub fn apply_look(&self, ctx: &egui::Context) {
+        install_look(ctx, self.theme);
+    }
+
     fn reveal(&mut self, path: &Path) {
         if let Err(err) = reveal_in_file_manager(path) {
             self.banner = Some(err);
@@ -1211,6 +1252,10 @@ impl Drop for DuplicateApp {
 impl eframe::App for DuplicateApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update(ctx);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("theme", self.theme.key().to_owned());
     }
 }
 
@@ -1275,28 +1320,176 @@ fn min_label(size: u64) -> &'static str {
         .unwrap_or("размер")
 }
 
-const BG: egui::Color32 = egui::Color32::from_rgb(12, 12, 16);
-const CARD: egui::Color32 = egui::Color32::from_rgb(26, 26, 34);
-const CARD_DIM: egui::Color32 = egui::Color32::from_rgb(18, 18, 24);
-const TEXT: egui::Color32 = egui::Color32::from_rgb(244, 244, 246);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(154, 154, 168);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(214, 255, 74);
-const INK: egui::Color32 = egui::Color32::from_rgb(16, 16, 16);
-const STROKE: egui::Color32 = egui::Color32::from_rgb(48, 48, 62);
-const STOP: egui::Color32 = egui::Color32::from_rgb(255, 107, 129);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeId {
+    Lime,
+    Berry,
+    Sea,
+    Sunset,
+    Day,
+}
 
-pub fn install_look(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = BG;
-    visuals.panel_fill = BG;
-    visuals.faint_bg_color = CARD;
-    visuals.extreme_bg_color = egui::Color32::from_rgb(8, 8, 12);
-    visuals.code_bg_color = CARD;
-    visuals.hyperlink_color = ACCENT;
-    visuals.selection.bg_fill = egui::Color32::from_rgb(62, 74, 24);
-    visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-    visuals.warn_fg_color = STOP;
-    visuals.error_fg_color = STOP;
+impl ThemeId {
+    const ALL: [ThemeId; 5] = [
+        ThemeId::Lime,
+        ThemeId::Berry,
+        ThemeId::Sea,
+        ThemeId::Sunset,
+        ThemeId::Day,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ThemeId::Lime => "лайм",
+            ThemeId::Berry => "ягода",
+            ThemeId::Sea => "море",
+            ThemeId::Sunset => "закат",
+            ThemeId::Day => "день",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            ThemeId::Lime => "lime",
+            ThemeId::Berry => "berry",
+            ThemeId::Sea => "sea",
+            ThemeId::Sunset => "sunset",
+            ThemeId::Day => "day",
+        }
+    }
+
+    fn parse(value: &str) -> Option<ThemeId> {
+        Self::ALL.into_iter().find(|theme| theme.key() == value)
+    }
+
+    fn palette(self) -> Palette {
+        let rgb = egui::Color32::from_rgb;
+        match self {
+            ThemeId::Lime => Palette {
+                bg: rgb(12, 12, 16),
+                card: rgb(26, 26, 34),
+                card_dim: rgb(18, 18, 24),
+                text: rgb(244, 244, 246),
+                muted: rgb(154, 154, 168),
+                accent: rgb(214, 255, 74),
+                ink: rgb(16, 16, 16),
+                stroke: rgb(48, 48, 62),
+                stop: rgb(255, 107, 129),
+                extreme: rgb(8, 8, 12),
+                selection: rgb(62, 74, 24),
+                hover: rgb(36, 36, 48),
+                active: rgb(54, 64, 22),
+                dark: true,
+            },
+            ThemeId::Berry => Palette {
+                bg: rgb(18, 10, 16),
+                card: rgb(36, 20, 32),
+                card_dim: rgb(24, 14, 22),
+                text: rgb(255, 236, 244),
+                muted: rgb(196, 150, 170),
+                accent: rgb(255, 92, 168),
+                ink: rgb(32, 8, 18),
+                stroke: rgb(72, 40, 58),
+                stop: rgb(255, 140, 150),
+                extreme: rgb(10, 6, 10),
+                selection: rgb(92, 28, 58),
+                hover: rgb(52, 28, 44),
+                active: rgb(84, 24, 52),
+                dark: true,
+            },
+            ThemeId::Sea => Palette {
+                bg: rgb(8, 16, 24),
+                card: rgb(16, 32, 44),
+                card_dim: rgb(10, 22, 32),
+                text: rgb(232, 248, 248),
+                muted: rgb(140, 176, 184),
+                accent: rgb(94, 234, 212),
+                ink: rgb(6, 28, 28),
+                stroke: rgb(36, 64, 76),
+                stop: rgb(255, 107, 129),
+                extreme: rgb(4, 10, 16),
+                selection: rgb(20, 72, 68),
+                hover: rgb(22, 48, 60),
+                active: rgb(18, 72, 64),
+                dark: true,
+            },
+            ThemeId::Sunset => Palette {
+                bg: rgb(24, 14, 10),
+                card: rgb(42, 26, 18),
+                card_dim: rgb(30, 18, 12),
+                text: rgb(255, 236, 220),
+                muted: rgb(196, 160, 136),
+                accent: rgb(255, 150, 64),
+                ink: rgb(36, 16, 4),
+                stroke: rgb(78, 48, 32),
+                stop: rgb(255, 107, 129),
+                extreme: rgb(14, 8, 6),
+                selection: rgb(92, 48, 16),
+                hover: rgb(58, 34, 22),
+                active: rgb(92, 48, 18),
+                dark: true,
+            },
+            ThemeId::Day => Palette {
+                bg: rgb(246, 244, 239),
+                card: rgb(255, 255, 255),
+                card_dim: rgb(236, 233, 226),
+                text: rgb(28, 27, 31),
+                muted: rgb(110, 106, 116),
+                accent: rgb(109, 76, 255),
+                ink: rgb(255, 255, 255),
+                stroke: rgb(214, 210, 200),
+                stop: rgb(190, 36, 68),
+                extreme: rgb(228, 224, 216),
+                selection: rgb(226, 220, 255),
+                hover: rgb(236, 232, 250),
+                active: rgb(214, 206, 255),
+                dark: false,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: egui::Color32,
+    card: egui::Color32,
+    card_dim: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    accent: egui::Color32,
+    ink: egui::Color32,
+    stroke: egui::Color32,
+    stop: egui::Color32,
+    extreme: egui::Color32,
+    selection: egui::Color32,
+    hover: egui::Color32,
+    active: egui::Color32,
+    dark: bool,
+}
+
+fn colors(ctx: &egui::Context) -> Palette {
+    ctx.data(|data| data.get_temp(egui::Id::new("dup-theme")))
+        .unwrap_or_else(|| ThemeId::Lime.palette())
+}
+
+fn install_look(ctx: &egui::Context, theme: ThemeId) {
+    let paint = theme.palette();
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("dup-theme"), paint));
+    let mut visuals = if paint.dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.window_fill = paint.bg;
+    visuals.panel_fill = paint.bg;
+    visuals.faint_bg_color = paint.card;
+    visuals.extreme_bg_color = paint.extreme;
+    visuals.code_bg_color = paint.card;
+    visuals.hyperlink_color = paint.accent;
+    visuals.selection.bg_fill = paint.selection;
+    visuals.selection.stroke = egui::Stroke::new(1.0, paint.accent);
+    visuals.warn_fg_color = paint.stop;
+    visuals.error_fg_color = paint.stop;
     visuals.window_corner_radius = egui::CornerRadius::same(16);
     visuals.menu_corner_radius = egui::CornerRadius::same(12);
     for widget in [
@@ -1308,18 +1501,21 @@ pub fn install_look(ctx: &egui::Context) {
     ] {
         widget.corner_radius = egui::CornerRadius::same(12);
     }
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    visuals.widgets.inactive.bg_fill = CARD;
-    visuals.widgets.inactive.weak_bg_fill = CARD;
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, STROKE);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(36, 36, 48);
-    visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(36, 36, 48);
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(54, 64, 22);
-    visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(54, 64, 22);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, ACCENT);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, paint.text);
+    visuals.widgets.inactive.bg_fill = paint.card;
+    visuals.widgets.inactive.weak_bg_fill = paint.card;
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, paint.text);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, paint.stroke);
+    visuals.widgets.hovered.bg_fill = paint.hover;
+    visuals.widgets.hovered.weak_bg_fill = paint.hover;
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, paint.text);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, paint.accent);
+    visuals.widgets.active.bg_fill = paint.active;
+    visuals.widgets.active.weak_bg_fill = paint.active;
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, paint.accent);
+    if !paint.dark {
+        visuals.widgets.noninteractive.bg_fill = paint.bg;
+    }
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
@@ -1329,27 +1525,28 @@ pub fn install_look(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-fn bar_frame() -> egui::Frame {
+fn bar_frame(ctx: &egui::Context) -> egui::Frame {
     egui::Frame::new()
-        .fill(BG)
+        .fill(colors(ctx).bg)
         .inner_margin(egui::Margin::symmetric(14, 10))
 }
 
-fn accent_button_widget(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text.into()).color(INK).strong())
-        .fill(ACCENT)
+fn accent_button_widget(text: impl Into<String>, paint: Palette) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text.into()).color(paint.ink).strong())
+        .fill(paint.accent)
         .corner_radius(16u8)
 }
 
 fn accent_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(accent_button_widget(text))
+    ui.add(accent_button_widget(text, colors(ui.ctx())))
 }
 
 fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let paint = colors(ui.ctx());
     ui.add(
-        egui::Button::new(egui::RichText::new(text).color(TEXT))
-            .fill(CARD)
-            .stroke(egui::Stroke::new(1.0, STROKE))
+        egui::Button::new(egui::RichText::new(text).color(paint.text))
+            .fill(paint.card)
+            .stroke(egui::Stroke::new(1.0, paint.stroke))
             .corner_radius(16u8),
     )
 }
@@ -1361,7 +1558,7 @@ fn stop_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
                 .color(egui::Color32::WHITE)
                 .strong(),
         )
-        .fill(STOP)
+        .fill(colors(ui.ctx()).stop)
         .corner_radius(16u8),
     )
 }
@@ -1375,15 +1572,28 @@ fn pill_tab(ui: &mut egui::Ui, selected: bool, text: impl Into<String>) -> egui:
     }
 }
 
-fn kind_color(kind: FormatKind) -> egui::Color32 {
-    match kind {
-        FormatKind::Image => egui::Color32::from_rgb(125, 211, 252),
-        FormatKind::Video => egui::Color32::from_rgb(196, 181, 253),
-        FormatKind::Audio => egui::Color32::from_rgb(253, 186, 116),
-        FormatKind::Document => egui::Color32::from_rgb(134, 239, 172),
-        FormatKind::Archive => egui::Color32::from_rgb(252, 211, 77),
-        FormatKind::Text => egui::Color32::from_rgb(103, 232, 249),
-        FormatKind::Other => egui::Color32::from_rgb(168, 168, 184),
+fn kind_color(kind: FormatKind, dark: bool) -> egui::Color32 {
+    let rgb = egui::Color32::from_rgb;
+    if dark {
+        match kind {
+            FormatKind::Image => rgb(125, 211, 252),
+            FormatKind::Video => rgb(196, 181, 253),
+            FormatKind::Audio => rgb(253, 186, 116),
+            FormatKind::Document => rgb(134, 239, 172),
+            FormatKind::Archive => rgb(252, 211, 77),
+            FormatKind::Text => rgb(103, 232, 249),
+            FormatKind::Other => rgb(168, 168, 184),
+        }
+    } else {
+        match kind {
+            FormatKind::Image => rgb(2, 132, 199),
+            FormatKind::Video => rgb(124, 58, 237),
+            FormatKind::Audio => rgb(234, 88, 12),
+            FormatKind::Document => rgb(22, 163, 74),
+            FormatKind::Archive => rgb(180, 120, 4),
+            FormatKind::Text => rgb(8, 145, 178),
+            FormatKind::Other => rgb(82, 82, 91),
+        }
     }
 }
 
